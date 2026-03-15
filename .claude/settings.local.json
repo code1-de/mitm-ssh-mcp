@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run:*)",
+      "mcp__mitm-ssh__ssh_connect",
+      "mcp__mitm-ssh__ssh_run",
+      "mcp__mitm-ssh__ssh_read",
+      "Bash(git ls-files:*)"
+    ]
+  }
+}
