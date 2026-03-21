@@ -1,10 +1,15 @@
 # mitm-ssh
 
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows)
+![MCP](https://img.shields.io/badge/MCP-streamable--http-green)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
 Tired of Claude running SSH commands behind your back? mitm-ssh sits between Claude and the SSH session so you can watch everything as it happens — just like a real terminal.
 
 The server runs as a separate process in a separate terminal window. You start it, keep it visible, and watch the full SSH session unfold in real time while Claude works.
 
-An MCP server that wraps `ssh.exe` as a subprocess, pipes its stdio through MCP tools, and displays the live terminal output in its own terminal window — like looking over Claude's shoulder. It also helps debug SSH and MCP connection issues by showing connection build-up and tear-down as status messages.
+An MCP server that wraps `ssh.exe` inside a Windows ConPTY, pipes its stdio through MCP tools, and displays the live terminal output in its own terminal window — like looking over Claude's shoulder. It also helps debug SSH and MCP connection issues by showing connection build-up and tear-down as status messages.
 
 ## How it works
 
@@ -22,6 +27,9 @@ Designed for Windows (uses `ssh.exe`). Requires Python 3.11+.
 # 1. Start the server (keep this terminal open)
 uv run server.py
 # or without uv: pip install mcp && python server.py
+
+# 1b. Optional: enable local keyboard input to the SSH session
+uv run server.py -i
 
 # 2. Register with Claude Code (once)
 claude mcp add -s user -t http mitm-ssh http://127.0.0.1:8022/mcp
