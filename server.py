@@ -77,8 +77,8 @@ class SSHSession:
                     break
                 text = chunk.decode("utf-8", errors="replace")
                 self.buffer.append(text)
-                sys.stderr.write(text)
-                sys.stderr.flush()
+                sys.stderr.buffer.write(chunk)
+                sys.stderr.buffer.flush()
                 # persistent log file (tail -f ssh_output.log)
                 if self._log:
                     self._log.write(text)
