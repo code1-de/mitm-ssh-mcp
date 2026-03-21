@@ -5,6 +5,8 @@ import logging
 import msvcrt
 import os
 import sys
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -259,7 +261,7 @@ class SSHSession:
         self.pty.spawn(cmdline)
         self._reader_task = asyncio.create_task(self._reader())
         if interactive_mode:
-            self._keyboard_task = asyncio.create_task(self._keyboard_loop())
+            self._start_keyboard_thread()
         self._resize_task = asyncio.create_task(self._resize_loop())
 
     async def _reader(self):
@@ -281,45 +283,45 @@ class SSHSession:
                 if len(self.buffer) > 10000:
                     self.buffer = self.buffer[-5000:]
                     self.read_cursor = 0
+                await asyncio.sleep(0.005)  # yield to event loop, prevent CPU spin
         except asyncio.CancelledError:
             pass
         except OSError:
             rc = self.pty.returncode if self.pty else None
             log.info("SSH session ended (exit code %s)", rc)
 
-    async def _keyboard_loop(self):
-        """Forward local keyboard input to the SSH session."""
-        loop = asyncio.get_event_loop()
+    def _start_keyboard_thread(self):
+        """Start keyboard reader in a dedicated daemon thread."""
+        t = threading.Thread(target=self._keyboard_thread, daemon=True)
+        t.start()
+
+    def _keyboard_thread(self):
+        """Blocking keyboard reader running in its own thread."""
+        ext_map = {
+            "H": "\033[A",  # Up
+            "P": "\033[B",  # Down
+            "M": "\033[C",  # Right
+            "K": "\033[D",  # Left
+            "G": "\033[H",  # Home
+            "O": "\033[F",  # End
+            "I": "\033[5~",  # PgUp
+            "Q": "\033[6~",  # PgDn
+            "S": "\033[3~",  # Delete
+            "R": "\033[2~",  # Insert
+        }
         try:
             while self.connected:
-                has_key = await loop.run_in_executor(None, msvcrt.kbhit)
-                if has_key:
-                    ch = await loop.run_in_executor(None, msvcrt.getwch)
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
                     if ch == "\x00" or ch == "\xe0":
-                        # Extended key (arrows, F-keys, etc.) — read second byte
-                        ch2 = await loop.run_in_executor(None, msvcrt.getwch)
-                        # Map common extended keys to ANSI sequences
-                        ext_map = {
-                            "H": "\033[A",  # Up
-                            "P": "\033[B",  # Down
-                            "M": "\033[C",  # Right
-                            "K": "\033[D",  # Left
-                            "G": "\033[H",  # Home
-                            "O": "\033[F",  # End
-                            "I": "\033[5~",  # PgUp
-                            "Q": "\033[6~",  # PgDn
-                            "S": "\033[3~",  # Delete
-                            "R": "\033[2~",  # Insert
-                        }
+                        ch2 = msvcrt.getwch()
                         seq = ext_map.get(ch2, "")
                         if seq:
-                            await loop.run_in_executor(None, self.pty.write, seq.encode())
+                            self.pty.write(seq.encode())
                     else:
-                        await loop.run_in_executor(None, self.pty.write, ch.encode())
+                        self.pty.write(ch.encode())
                 else:
-                    await asyncio.sleep(0.02)
-        except asyncio.CancelledError:
-            pass
+                    time.sleep(0.02)
         except OSError:
             pass
 
@@ -376,7 +378,7 @@ class SSHSession:
                     break
                 await asyncio.sleep(0.1)
             log.info("SSH process terminated (exit code %s)", self.pty.returncode)
-        for attr in ("_reader_task", "_keyboard_task", "_resize_task"):
+        for attr in ("_reader_task", "_resize_task"):
             task = getattr(self, attr, None)
             if task:
                 task.cancel()
