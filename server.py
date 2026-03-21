@@ -1,5 +1,9 @@
 import asyncio
+import ctypes
+import ctypes.wintypes as wt
 import logging
+import msvcrt
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,17 +39,201 @@ mcp = FastMCP("mitm-ssh", host="127.0.0.1", port=MCP_PORT, lifespan=lifespan, lo
 
 LOG_FILE = Path(__file__).parent / "ssh_output.log"
 
+# ── ConPTY helpers (Windows) ────────────────────────────────────────────────
+
+k32 = ctypes.windll.kernel32
+HANDLE = wt.HANDLE
+DWORD = wt.DWORD
+HRESULT = ctypes.HRESULT
+BOOL = wt.BOOL
+LPVOID = wt.LPVOID
+SIZE_T = ctypes.c_size_t
+
+PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+INVALID_HANDLE_VALUE = HANDLE(-1).value
+
+
+class COORD(ctypes.Structure):
+    _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+
+class STARTUPINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cb", DWORD),
+        ("lpReserved", ctypes.c_wchar_p),
+        ("lpDesktop", ctypes.c_wchar_p),
+        ("lpTitle", ctypes.c_wchar_p),
+        ("dwX", DWORD),
+        ("dwY", DWORD),
+        ("dwXSize", DWORD),
+        ("dwYSize", DWORD),
+        ("dwXCountChars", DWORD),
+        ("dwYCountChars", DWORD),
+        ("dwFillAttribute", DWORD),
+        ("dwFlags", DWORD),
+        ("wShowWindow", wt.WORD),
+        ("cbReserved2", wt.WORD),
+        ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+        ("hStdInput", HANDLE),
+        ("hStdOutput", HANDLE),
+        ("hStdError", HANDLE),
+        ("lpAttributeList", LPVOID),
+    ]
+
+
+class PROCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", HANDLE),
+        ("hThread", HANDLE),
+        ("dwProcessId", DWORD),
+        ("dwThreadId", DWORD),
+    ]
+
+
+class SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("nLength", DWORD),
+        ("lpSecurityDescriptor", LPVOID),
+        ("bInheritHandle", BOOL),
+    ]
+
+
+def _create_pipe():
+    """Create an inheritable pipe, return (read_handle, write_handle)."""
+    read_h = HANDLE()
+    write_h = HANDLE()
+    sa = SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(sa)
+    sa.lpSecurityDescriptor = None
+    sa.bInheritHandle = True
+    if not k32.CreatePipe(ctypes.byref(read_h), ctypes.byref(write_h), ctypes.byref(sa), 0):
+        raise ctypes.WinError()
+    return read_h.value, write_h.value
+
+
+class ConPTY:
+    """Spawn a process inside a Windows ConPTY."""
+
+    def __init__(self, cols: int = 80, rows: int = 24):
+        self.pty_handle = None
+        self.process_handle = None
+        self.pid = 0
+        self._pty_input_write = None
+        self._pty_output_read = None
+        self._attr_list_buf = None
+        self.cols = cols
+        self.rows = rows
+
+    def spawn(self, cmdline: str):
+        # Create pipes: we write to pty_input, read from pty_output
+        pty_input_read, self._pty_input_write = _create_pipe()
+        self._pty_output_read, pty_output_write = _create_pipe()
+
+        # Create pseudo console
+        size = COORD(self.cols, self.rows)
+        pty_h = HANDLE()
+        hr = k32.CreatePseudoConsole(size, HANDLE(pty_input_read), HANDLE(pty_output_write), DWORD(0), ctypes.byref(pty_h))
+        if hr != 0:
+            raise ctypes.WinError(hr)
+        self.pty_handle = pty_h.value
+
+        # Close pipe ends that the ConPTY now owns
+        k32.CloseHandle(HANDLE(pty_input_read))
+        k32.CloseHandle(HANDLE(pty_output_write))
+
+        # Prepare startup info with attribute list
+        attr_count = ctypes.c_size_t(0)
+        k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_count))
+        self._attr_list_buf = (ctypes.c_byte * attr_count.value)()
+        if not k32.InitializeProcThreadAttributeList(self._attr_list_buf, 1, 0, ctypes.byref(attr_count)):
+            raise ctypes.WinError()
+        if not k32.UpdateProcThreadAttribute(
+            self._attr_list_buf, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            HANDLE(self.pty_handle), ctypes.sizeof(HANDLE), None, None,
+        ):
+            raise ctypes.WinError()
+
+        si = STARTUPINFOEXW()
+        ctypes.memset(ctypes.byref(si), 0, ctypes.sizeof(si))
+        si.cb = ctypes.sizeof(si)
+        si.lpAttributeList = ctypes.cast(self._attr_list_buf, LPVOID)
+
+        pi = PROCESS_INFORMATION()
+        if not k32.CreateProcessW(
+            None, cmdline, None, None, False,
+            EXTENDED_STARTUPINFO_PRESENT, None, None,
+            ctypes.byref(si), ctypes.byref(pi),
+        ):
+            raise ctypes.WinError()
+
+        self.process_handle = pi.hProcess
+        self.pid = pi.dwProcessId
+        k32.CloseHandle(pi.hThread)
+
+        log.info("ConPTY process started (pid %d, %dx%d)", self.pid, self.cols, self.rows)
+
+    def write(self, data: bytes):
+        written = DWORD()
+        k32.WriteFile(HANDLE(self._pty_input_write), data, len(data), ctypes.byref(written), None)
+
+    def read(self, size: int = 4096) -> bytes:
+        buf = (ctypes.c_byte * size)()
+        read_count = DWORD()
+        ok = k32.ReadFile(HANDLE(self._pty_output_read), buf, size, ctypes.byref(read_count), None)
+        if not ok or read_count.value == 0:
+            return b""
+        return bytes(buf[: read_count.value])
+
+    def resize(self, cols: int, rows: int):
+        self.cols = cols
+        self.rows = rows
+        if self.pty_handle:
+            size = COORD(cols, rows)
+            k32.ResizePseudoConsole(HANDLE(self.pty_handle), size)
+
+    @property
+    def returncode(self) -> int | None:
+        code = DWORD()
+        k32.GetExitCodeProcess(HANDLE(self.process_handle), ctypes.byref(code))
+        if code.value == 259:  # STILL_ACTIVE
+            return None
+        return code.value
+
+    def terminate(self):
+        k32.TerminateProcess(HANDLE(self.process_handle), 1)
+
+    def close(self):
+        if self.pty_handle:
+            k32.ClosePseudoConsole(HANDLE(self.pty_handle))
+            self.pty_handle = None
+        if self._pty_input_write:
+            k32.CloseHandle(HANDLE(self._pty_input_write))
+            self._pty_input_write = None
+        if self._pty_output_read:
+            k32.CloseHandle(HANDLE(self._pty_output_read))
+            self._pty_output_read = None
+        if self.process_handle:
+            k32.CloseHandle(HANDLE(self.process_handle))
+            self.process_handle = None
+        if self._attr_list_buf:
+            k32.DeleteProcThreadAttributeList(self._attr_list_buf)
+            self._attr_list_buf = None
+
+
+# ── SSH Session ─────────────────────────────────────────────────────────────
+
 
 class SSHSession:
     def __init__(self):
-        self.process: asyncio.subprocess.Process | None = None
+        self.pty: ConPTY | None = None
         self.buffer: list[str] = []
         self.read_cursor: int = 0
-        self._tasks: list[asyncio.Task] = []
+        self._reader_task: asyncio.Task | None = None
         self._log = None
 
     async def connect(self, cmd: list[str]):
-        if self.process and self.process.returncode is None:
+        if self.pty and self.pty.returncode is None:
             raise RuntimeError("Already connected. Disconnect first.")
 
         log.info("SSH connecting: %s", " ".join(cmd))
@@ -53,48 +241,49 @@ class SSHSession:
         self.buffer = []
         self.read_cursor = 0
 
-        self.process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        log.info("SSH process started (pid %d)", self.process.pid)
-        self._tasks = [
-            asyncio.create_task(self._reader(self.process.stdout, "stdout")),
-            asyncio.create_task(self._reader(self.process.stderr, "stderr")),
-        ]
+        try:
+            ts = os.get_terminal_size()
+            cols, rows = ts.columns, ts.lines
+            log.info("Terminal size detected: %dx%d", cols, rows)
+        except OSError:
+            cols, rows = 80, 24
+            log.info("Terminal size not available, using default: %dx%d", cols, rows)
 
-    async def _reader(self, stream: asyncio.StreamReader, label: str):
-        log.debug("Reader started for %s", label)
+        self.pty = ConPTY(cols=cols, rows=rows)
+        cmdline = " ".join(cmd)
+        self.pty.spawn(cmdline)
+        self._reader_task = asyncio.create_task(self._reader())
+
+    async def _reader(self):
+        loop = asyncio.get_event_loop()
         try:
             while True:
-                chunk = await stream.read(4096)
+                chunk = await loop.run_in_executor(None, self.pty.read, 4096)
                 if not chunk:
-                    if label == "stdout" and self.process:
-                        code = await self.process.wait()
-                        log.info("SSH session ended (exit code %d)", code)
+                    rc = self.pty.returncode
+                    log.info("SSH session ended (exit code %s)", rc)
                     break
                 text = chunk.decode("utf-8", errors="replace")
                 self.buffer.append(text)
                 sys.stderr.buffer.write(chunk)
                 sys.stderr.buffer.flush()
-                # persistent log file (tail -f ssh_output.log)
                 if self._log:
                     self._log.write(text)
                     self._log.flush()
-                # cap buffer
                 if len(self.buffer) > 10000:
                     self.buffer = self.buffer[-5000:]
                     self.read_cursor = 0
         except asyncio.CancelledError:
             pass
+        except OSError:
+            rc = self.pty.returncode if self.pty else None
+            log.info("SSH session ended (exit code %s)", rc)
 
     async def send(self, data: str):
-        if not self.process or self.process.returncode is not None:
+        if not self.connected:
             raise RuntimeError("Not connected.")
-        self.process.stdin.write(data.encode())
-        await self.process.stdin.drain()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.pty.write, data.encode())
 
     def get_new(self) -> str:
         """Return output since last read, advance cursor."""
@@ -109,22 +298,24 @@ class SSHSession:
 
     @property
     def connected(self) -> bool:
-        return self.process is not None and self.process.returncode is None
+        return self.pty is not None and self.pty.returncode is None
 
     async def disconnect(self):
-        log.info("SSH disconnecting (pid %s)", self.process.pid if self.process else "N/A")
-        if self.process and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5)
-                log.info("SSH process terminated (exit code %d)", self.process.returncode)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                log.warning("SSH process killed after timeout")
-        for t in self._tasks:
-            t.cancel()
-        self._tasks = []
-        self.process = None
+        pid = self.pty.pid if self.pty else "N/A"
+        log.info("SSH disconnecting (pid %s)", pid)
+        if self.pty and self.pty.returncode is None:
+            self.pty.terminate()
+            for _ in range(50):
+                if self.pty.returncode is not None:
+                    break
+                await asyncio.sleep(0.1)
+            log.info("SSH process terminated (exit code %s)", self.pty.returncode)
+        if self._reader_task:
+            self._reader_task.cancel()
+            self._reader_task = None
+        if self.pty:
+            self.pty.close()
+            self.pty = None
         if self._log:
             self._log.close()
             self._log = None
@@ -223,9 +414,9 @@ async def ssh_status() -> str:
     """Check whether an SSH session is active."""
     log.debug("Tool ssh_status()")
     if session.connected:
-        return "Connected (pid {})".format(session.process.pid)
-    if session.process and session.process.returncode is not None:
-        return f"Exited with code {session.process.returncode}"
+        return "Connected (pid {})".format(session.pty.pid)
+    if session.pty and session.pty.returncode is not None:
+        return f"Exited with code {session.pty.returncode}"
     return "Not connected"
 
 
