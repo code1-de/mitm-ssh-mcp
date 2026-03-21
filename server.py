@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import ctypes
 import ctypes.wintypes as wt
 import logging
@@ -234,9 +235,9 @@ class SSHSession:
         self.pty: ConPTY | None = None
         self.buffer: list[str] = []
         self.read_cursor: int = 0
-        self._reader_task: asyncio.Task | None = None
-        self._keyboard_task: asyncio.Task | None = None
         self._resize_task: asyncio.Task | None = None
+        self._display_queue: collections.deque = collections.deque()
+        self._write_queue: collections.deque = collections.deque()
         self._log = None
 
     async def connect(self, cmd: list[str]):
@@ -260,7 +261,11 @@ class SSHSession:
         cmdline = " ".join(cmd)
         self.pty.spawn(cmdline)
         self._reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
+        self._display_thread = threading.Thread(target=self._display_thread_func, daemon=True)
+        self._writer_thread = threading.Thread(target=self._writer_thread_func, daemon=True)
         self._reader_thread.start()
+        self._display_thread.start()
+        self._writer_thread.start()
         if interactive_mode:
             self._start_keyboard_thread()
         self._resize_task = asyncio.create_task(self._resize_loop())
@@ -276,17 +281,41 @@ class SSHSession:
                     break
                 text = chunk.decode("utf-8", errors="replace")
                 self.buffer.append(text)
-                sys.stderr.buffer.write(chunk)
-                sys.stderr.buffer.flush()
-                if self._log:
-                    self._log.write(text)
-                    self._log.flush()
+                self._display_queue.append((chunk, text))
                 if len(self.buffer) > 10000:
                     self.buffer = self.buffer[-5000:]
                     self.read_cursor = 0
         except OSError:
             rc = self.pty.returncode if self.pty else None
             log.info("SSH session ended (exit code %s)", rc)
+
+    def _display_thread_func(self):
+        """Write to stderr/log in a separate thread so console slowness can't block the reader."""
+        try:
+            while self.connected or self._display_queue:
+                if self._display_queue:
+                    chunk, text = self._display_queue.popleft()
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.buffer.flush()
+                    if self._log:
+                        self._log.write(text)
+                        self._log.flush()
+                else:
+                    time.sleep(0.01)
+        except OSError:
+            pass
+
+    def _writer_thread_func(self):
+        """Write to ConPTY input in a separate thread so it never blocks the event loop."""
+        try:
+            while self.connected or self._write_queue:
+                if self._write_queue:
+                    data = self._write_queue.popleft()
+                    self.pty.write(data)
+                else:
+                    time.sleep(0.005)
+        except OSError:
+            pass
 
     def _start_keyboard_thread(self):
         """Start keyboard reader in a dedicated daemon thread."""
@@ -349,8 +378,7 @@ class SSHSession:
     async def send(self, data: str):
         if not self.connected:
             raise RuntimeError("Not connected.")
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.pty.write, data.encode())
+        self._write_queue.append(data.encode())
 
     def get_new(self) -> str:
         """Return output since last read, advance cursor."""
