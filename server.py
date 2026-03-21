@@ -259,16 +259,17 @@ class SSHSession:
         self.pty = ConPTY(cols=cols, rows=rows)
         cmdline = " ".join(cmd)
         self.pty.spawn(cmdline)
-        self._reader_task = asyncio.create_task(self._reader())
+        self._reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
+        self._reader_thread.start()
         if interactive_mode:
             self._start_keyboard_thread()
         self._resize_task = asyncio.create_task(self._resize_loop())
 
-    async def _reader(self):
-        loop = asyncio.get_event_loop()
+    def _reader_thread_func(self):
+        """Blocking reader running in its own thread."""
         try:
             while True:
-                chunk = await loop.run_in_executor(None, self.pty.read, 4096)
+                chunk = self.pty.read(4096)
                 if not chunk:
                     rc = self.pty.returncode
                     log.info("SSH session ended (exit code %s)", rc)
@@ -283,9 +284,6 @@ class SSHSession:
                 if len(self.buffer) > 10000:
                     self.buffer = self.buffer[-5000:]
                     self.read_cursor = 0
-                await asyncio.sleep(0.005)  # yield to event loop, prevent CPU spin
-        except asyncio.CancelledError:
-            pass
         except OSError:
             rc = self.pty.returncode if self.pty else None
             log.info("SSH session ended (exit code %s)", rc)
@@ -351,7 +349,8 @@ class SSHSession:
     async def send(self, data: str):
         if not self.connected:
             raise RuntimeError("Not connected.")
-        self.pty.write(data.encode())
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.pty.write, data.encode())
 
     def get_new(self) -> str:
         """Return output since last read, advance cursor."""
@@ -378,7 +377,7 @@ class SSHSession:
                     break
                 await asyncio.sleep(0.1)
             log.info("SSH process terminated (exit code %s)", self.pty.returncode)
-        for attr in ("_reader_task", "_resize_task"):
+        for attr in ("_resize_task",):
             task = getattr(self, attr, None)
             if task:
                 task.cancel()
