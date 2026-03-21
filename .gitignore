@@ -1,2 +1,4 @@
 __pycache__/
 ssh_output.log
+uv.lock
+.claude/
