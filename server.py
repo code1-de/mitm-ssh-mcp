@@ -130,10 +130,10 @@ class ConPTY:
         pty_input_read, self._pty_input_write = _create_pipe()
         self._pty_output_read, pty_output_write = _create_pipe()
 
-        # Create pseudo console
-        size = COORD(self.cols, self.rows)
+        # Create pseudo console (pack COORD as int to avoid struct-by-value issues)
+        coord_packed = self.cols | (self.rows << 16)
         pty_h = HANDLE()
-        hr = k32.CreatePseudoConsole(size, HANDLE(pty_input_read), HANDLE(pty_output_write), DWORD(0), ctypes.byref(pty_h))
+        hr = k32.CreatePseudoConsole(coord_packed, HANDLE(pty_input_read), HANDLE(pty_output_write), DWORD(0), ctypes.byref(pty_h))
         if hr != 0:
             raise ctypes.WinError(hr)
         self.pty_handle = pty_h.value
@@ -178,7 +178,7 @@ class ConPTY:
         k32.WriteFile(HANDLE(self._pty_input_write), data, len(data), ctypes.byref(written), None)
 
     def read(self, size: int = 4096) -> bytes:
-        buf = (ctypes.c_byte * size)()
+        buf = (ctypes.c_ubyte * size)()
         read_count = DWORD()
         ok = k32.ReadFile(HANDLE(self._pty_output_read), buf, size, ctypes.byref(read_count), None)
         if not ok or read_count.value == 0:
@@ -189,8 +189,11 @@ class ConPTY:
         self.cols = cols
         self.rows = rows
         if self.pty_handle:
-            size = COORD(cols, rows)
-            k32.ResizePseudoConsole(HANDLE(self.pty_handle), size)
+            # Pack COORD as raw int to avoid ctypes struct-by-value issues
+            coord_packed = cols | (rows << 16)
+            hr = k32.ResizePseudoConsole(HANDLE(self.pty_handle), coord_packed)
+            if hr != 0:
+                log.warning("ResizePseudoConsole failed: 0x%08x", hr)
 
     @property
     def returncode(self) -> int | None:
@@ -230,6 +233,8 @@ class SSHSession:
         self.buffer: list[str] = []
         self.read_cursor: int = 0
         self._reader_task: asyncio.Task | None = None
+        self._keyboard_task: asyncio.Task | None = None
+        self._resize_task: asyncio.Task | None = None
         self._log = None
 
     async def connect(self, cmd: list[str]):
@@ -253,6 +258,9 @@ class SSHSession:
         cmdline = " ".join(cmd)
         self.pty.spawn(cmdline)
         self._reader_task = asyncio.create_task(self._reader())
+        if interactive_mode:
+            self._keyboard_task = asyncio.create_task(self._keyboard_loop())
+        self._resize_task = asyncio.create_task(self._resize_loop())
 
     async def _reader(self):
         loop = asyncio.get_event_loop()
@@ -279,11 +287,69 @@ class SSHSession:
             rc = self.pty.returncode if self.pty else None
             log.info("SSH session ended (exit code %s)", rc)
 
+    async def _keyboard_loop(self):
+        """Forward local keyboard input to the SSH session."""
+        loop = asyncio.get_event_loop()
+        try:
+            while self.connected:
+                has_key = await loop.run_in_executor(None, msvcrt.kbhit)
+                if has_key:
+                    ch = await loop.run_in_executor(None, msvcrt.getwch)
+                    if ch == "\x00" or ch == "\xe0":
+                        # Extended key (arrows, F-keys, etc.) — read second byte
+                        ch2 = await loop.run_in_executor(None, msvcrt.getwch)
+                        # Map common extended keys to ANSI sequences
+                        ext_map = {
+                            "H": "\033[A",  # Up
+                            "P": "\033[B",  # Down
+                            "M": "\033[C",  # Right
+                            "K": "\033[D",  # Left
+                            "G": "\033[H",  # Home
+                            "O": "\033[F",  # End
+                            "I": "\033[5~",  # PgUp
+                            "Q": "\033[6~",  # PgDn
+                            "S": "\033[3~",  # Delete
+                            "R": "\033[2~",  # Insert
+                        }
+                        seq = ext_map.get(ch2, "")
+                        if seq:
+                            await loop.run_in_executor(None, self.pty.write, seq.encode())
+                    else:
+                        await loop.run_in_executor(None, self.pty.write, ch.encode())
+                else:
+                    await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            pass
+        except OSError:
+            pass
+
+    async def _resize_loop(self):
+        """Watch for terminal resize and update ConPTY."""
+        last_cols, last_rows = self.pty.cols, self.pty.rows
+        await asyncio.sleep(3)  # let initial connection settle
+        try:
+            while self.connected:
+                await asyncio.sleep(1)
+                try:
+                    ts = os.get_terminal_size()
+                    new_cols, new_rows = ts.columns, ts.lines
+                    if new_cols != last_cols or new_rows != last_rows:
+                        # Debounce: confirm size is stable
+                        await asyncio.sleep(0.5)
+                        ts2 = os.get_terminal_size()
+                        if ts2.columns == new_cols and ts2.lines == new_rows:
+                            last_cols, last_rows = new_cols, new_rows
+                            self.pty.resize(last_cols, last_rows)
+                            log.info("Terminal resized: %dx%d", last_cols, last_rows)
+                except OSError:
+                    pass
+        except asyncio.CancelledError:
+            pass
+
     async def send(self, data: str):
         if not self.connected:
             raise RuntimeError("Not connected.")
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.pty.write, data.encode())
+        self.pty.write(data.encode())
 
     def get_new(self) -> str:
         """Return output since last read, advance cursor."""
@@ -310,9 +376,11 @@ class SSHSession:
                     break
                 await asyncio.sleep(0.1)
             log.info("SSH process terminated (exit code %s)", self.pty.returncode)
-        if self._reader_task:
-            self._reader_task.cancel()
-            self._reader_task = None
+        for attr in ("_reader_task", "_keyboard_task", "_resize_task"):
+            task = getattr(self, attr, None)
+            if task:
+                task.cancel()
+                setattr(self, attr, None)
         if self.pty:
             self.pty.close()
             self.pty = None
@@ -369,9 +437,19 @@ async def ssh_run(command: str) -> str:
     """
     log.debug("Tool ssh_run(command=%r)", command)
     await session.send(command + "\n")
-    await asyncio.sleep(1)
-    output = session.get_new()
-    return output or "(no new output yet)"
+    # Poll until output stabilizes or timeout
+    await asyncio.sleep(0.1)
+    for _ in range(18):  # up to ~2s total
+        output = session.get_new()
+        if output:
+            await asyncio.sleep(0.1)
+            more = session.get_new()
+            if not more:
+                return output
+            output += more
+            return output
+        await asyncio.sleep(0.1)
+    return session.get_new() or "(no new output yet)"
 
 
 @mcp.tool()
@@ -430,6 +508,17 @@ async def ssh_disconnect() -> str:
     return "Disconnected."
 
 
+interactive_mode = False
+
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="mitm-ssh MCP server")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Enable local keyboard input to SSH session")
+    args = parser.parse_args()
+    interactive_mode = args.interactive
+
     log.info("mitm-ssh MCP server starting on http://127.0.0.1:%d/mcp", MCP_PORT)
+    if interactive_mode:
+        log.info("Interactive mode: keyboard input enabled")
     mcp.run(transport="streamable-http")
