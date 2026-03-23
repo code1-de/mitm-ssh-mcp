@@ -547,6 +547,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
     interactive_mode = args.interactive
 
+    # Ignore Ctrl+C: Windows API handler + Python signal ignore
+    CTRL_C_EVENT = 0
+    CTRL_BREAK_EVENT = 1
+    @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+    def _ctrl_handler(event):
+        if event == CTRL_C_EVENT:
+            if session.connected:
+                session._write_queue.append(b"\x03")
+            return 1  # handled, don't kill
+        if event == CTRL_BREAK_EVENT:
+            return 0  # let it through — kills the server
+        return 0
+    k32.SetConsoleCtrlHandler(_ctrl_handler, True)
+    _ctrl_handler_ref = _ctrl_handler  # prevent garbage collection
+
     log.info("mitm-ssh MCP server starting on http://127.0.0.1:%d/mcp", MCP_PORT)
     if interactive_mode:
         log.info("Interactive mode: keyboard input enabled")
