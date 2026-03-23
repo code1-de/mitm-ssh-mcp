@@ -58,6 +58,7 @@ Claude will call `ssh_connect`, then `ssh_run` with `df -h`, and report back.
 ## Notes
 
 - **Key-based auth recommended** — password auth is unreliable without a real PTY
-- **ANSI pass-through** — the `-tt` flag forces PTY allocation on the remote side, so you get colors and full terminal output
+- **ANSI pass-through** — ConPTY gives ssh.exe a real terminal, so you get colors and full TUI output
+- **Ctrl+C** is forwarded to the SSH session (transparent) — use **Ctrl+Break** to kill the server
 - SSH output is also appended to `ssh_output.log`
 - Server listens on `127.0.0.1:8022` (localhost only)

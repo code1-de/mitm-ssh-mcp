@@ -557,7 +557,8 @@ if __name__ == "__main__":
                 session._write_queue.append(b"\x03")
             return 1  # handled, don't kill
         if event == CTRL_BREAK_EVENT:
-            return 0  # let it through — kills the server
+            log.info("Ctrl+Break — exiting")
+            os._exit(0)
         return 0
     k32.SetConsoleCtrlHandler(_ctrl_handler, True)
     _ctrl_handler_ref = _ctrl_handler  # prevent garbage collection
