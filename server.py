@@ -239,6 +239,7 @@ class SSHSession:
         self._display_queue: collections.deque = collections.deque()
         self._write_queue: collections.deque = collections.deque()
         self._log = None
+        self.eol: str = "\n"
 
     async def connect(self, cmd: list[str]):
         if self.pty and self.pty.returncode is None:
@@ -272,11 +273,12 @@ class SSHSession:
 
     def _reader_thread_func(self):
         """Blocking reader running in its own thread."""
+        pty = self.pty
         try:
             while True:
-                chunk = self.pty.read(4096)
+                chunk = pty.read(4096)
                 if not chunk:
-                    rc = self.pty.returncode
+                    rc = pty.returncode if pty else None
                     log.info("SSH session ended (exit code %s)", rc)
                     break
                 text = chunk.decode("utf-8", errors="replace")
@@ -285,8 +287,8 @@ class SSHSession:
                 if len(self.buffer) > 10000:
                     self.buffer = self.buffer[-5000:]
                     self.read_cursor = 0
-        except OSError:
-            rc = self.pty.returncode if self.pty else None
+        except (OSError, AttributeError):
+            rc = pty.returncode if pty else None
             log.info("SSH session ended (exit code %s)", rc)
 
     def _display_thread_func(self):
@@ -307,14 +309,15 @@ class SSHSession:
 
     def _writer_thread_func(self):
         """Write to ConPTY input in a separate thread so it never blocks the event loop."""
+        pty = self.pty
         try:
             while self.connected or self._write_queue:
-                if self._write_queue:
+                if self._write_queue and pty:
                     data = self._write_queue.popleft()
-                    self.pty.write(data)
+                    pty.write(data)
                 else:
                     time.sleep(0.005)
-        except OSError:
+        except (OSError, AttributeError):
             pass
 
     def _start_keyboard_thread(self):
@@ -428,6 +431,7 @@ async def ssh_connect(
     port: int = 22,
     identity_file: str = "",
     extra_args: str = "",
+    eol: str = "\n",
 ) -> str:
     """Connect to an SSH host via ssh.exe.
 
@@ -437,6 +441,10 @@ async def ssh_connect(
         port: SSH port (default 22).
         identity_file: Path to private key file (optional).
         extra_args: Additional ssh arguments as a single string (optional).
+        eol: End-of-line sent by ssh_run after each command. Default "\\n"
+            works for most Unix shells. Use "\\r" for devices whose CLI runs
+            in raw mode and expects CR (e.g. MikroTik RouterOS, some network
+            switches). Use "\\r\\n" if both are required.
     """
     log.info("Tool ssh_connect(host=%s, user=%s, port=%d)", host, user, port)
     cmd = ["ssh.exe", "-tt", "-o", "StrictHostKeyChecking=accept-new"]
@@ -450,6 +458,7 @@ async def ssh_connect(
         cmd.extend(extra_args.split())
     cmd.append(host)
 
+    session.eol = eol.encode("utf-8").decode("unicode_escape")
     await session.connect(cmd)
     # give ssh a moment to connect and produce initial output
     await asyncio.sleep(2)
@@ -465,7 +474,7 @@ async def ssh_run(command: str) -> str:
         command: The command to execute (Enter is appended automatically).
     """
     log.debug("Tool ssh_run(command=%r)", command)
-    await session.send(command + "\n")
+    await session.send(command + session.eol)
     # Poll until output stabilizes or timeout
     await asyncio.sleep(0.1)
     for _ in range(18):  # up to ~2s total
